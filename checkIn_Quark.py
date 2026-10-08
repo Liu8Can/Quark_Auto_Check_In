@@ -8,8 +8,10 @@ and the newer captured-URL format are supported.
 from __future__ import annotations
 
 import os
+import random
 import re
 import sys
+import time
 from typing import Callable
 from urllib.parse import unquote, urlparse
 
@@ -140,24 +142,31 @@ class Quark:
         }
 
     def _request(self, method: str, url: str, **kwargs) -> dict:
-        try:
-            response = self.session.request(
-                method, url, timeout=self.timeout, **kwargs
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except requests.Timeout as exc:
-            raise QuarkAPIError("请求夸克接口超时") from exc
-        except requests.RequestException as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            detail = f"HTTP {status}" if status else type(exc).__name__
-            raise QuarkAPIError(f"请求夸克接口失败（{detail}）") from exc
-        except ValueError as exc:
-            raise QuarkAPIError("夸克接口返回了无法解析的数据") from exc
-
-        if not isinstance(payload, dict):
-            raise QuarkAPIError("夸克接口返回格式异常")
-        return payload
+        stage = "查询签到状态" if method == "GET" else "提交签到"
+        attempts = 3 if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            started = time.monotonic()
+            try:
+                response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise QuarkAPIError(f"{stage}返回格式异常")
+                return payload
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                print(f"⚠️ {stage}第 {attempt}/{attempts} 次失败：{type(exc).__name__}，耗时 {time.monotonic()-started:.1f}s")
+                if attempt == attempts:
+                    raise QuarkAPIError(f"{stage}网络失败（{type(exc).__name__}）") from exc
+                time.sleep(2 ** (attempt - 1) + random.uniform(0, 1))
+            except requests.RequestException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if method == "GET" and status in (429, 500, 502, 503, 504) and attempt < attempts:
+                    time.sleep(2 ** (attempt - 1) + random.uniform(0, 1))
+                    continue
+                raise QuarkAPIError(f"{stage}请求失败（HTTP {status or 'unknown'}）") from exc
+            except ValueError as exc:
+                raise QuarkAPIError(f"{stage}返回了无法解析的数据") from exc
+        raise QuarkAPIError(f"{stage}重试耗尽")
 
     def get_growth_info(self) -> dict:
         payload = self._request("GET", INFO_URL, params=self._params())
@@ -205,7 +214,18 @@ class Quark:
                 f"连签进度（{progress}/{target}）"
             )
         else:
-            reward = self.get_growth_sign()
+            try:
+                reward = self.get_growth_sign()
+            except QuarkAPIError as exc:
+                if "网络失败" not in str(exc):
+                    raise
+                print("⚠️ POST 结果不确定，重新查询签到状态")
+                verified = self.get_growth_info().get("cap_sign")
+                if not isinstance(verified, dict) or not verified.get("sign_daily"):
+                    raise QuarkAPIError("未确认签到成功，等待定时补签") from exc
+                reward = verified.get("sign_daily_reward", 0)
+                lines.append("✅ 复查确认今日已签到")
+                return "\n".join(lines)
             next_progress = progress + 1 if isinstance(progress, int) else "?"
             lines.append(
                 f"✅ 签到成功 +{self.convert_bytes(reward)}，"
